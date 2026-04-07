@@ -477,6 +477,7 @@ class MainWindow(QMainWindow):
         self.log_worker.batch_ready.connect(self._append_log_batch)
         self.log_worker.status_changed.connect(self.statusBar().showMessage)
         self.log_worker.error.connect(self._handle_log_error)
+        self.log_worker.pid_map_updated.connect(self._handle_pid_map_update)
         self.log_worker.finished.connect(self.log_thread.quit)
         self.log_worker.finished.connect(self.log_worker.deleteLater)
         self.log_thread.finished.connect(self._on_log_thread_finished)
@@ -525,6 +526,15 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.device_combo.setEnabled(True)
         self.statusBar().showMessage("Logcat da dung.")
+
+    def _handle_pid_map_update(self, pid_map: dict) -> None:
+        updated = self.log_store.update_packages(pid_map)
+        if updated > 0:
+            # Force refresh of package column
+            top_left = self.model.index(0, 3)  # Column 3 is Package
+            bottom_right = self.model.index(self.model.rowCount() - 1, 3)
+            self.model.dataChanged.emit(top_left, bottom_right)
+            self._schedule_filter_refresh(immediate=True)
 
     def _on_device_thread_finished(self) -> None:
         self.device_thread = None

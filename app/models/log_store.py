@@ -8,6 +8,7 @@ class LogStore:
         self._max_entries = max(1_000, int(max_entries))
         self._entries: list[LogEntry] = []
         self._version = 0
+        self._first_pid_update = True
 
     @property
     def max_entries(self) -> int:
@@ -53,3 +54,20 @@ class LogStore:
         del self._entries[:overflow]
         self._version += 1
         return dropped_entries
+
+    def update_packages(self, pid_map: dict[str, str]) -> int:
+        updated_count = 0
+        if self._first_pid_update:
+            for entry in self._entries:
+                if not entry.package and entry.pid in pid_map:
+                    entry.package = pid_map[entry.pid]
+                    updated_count += 1
+            self._first_pid_update = False
+        else:
+            for entry in self._entries[-1000:]:
+                if not entry.package and entry.pid in pid_map:
+                    entry.package = pid_map[entry.pid]
+                    updated_count += 1
+        if updated_count:
+            self._version += 1
+        return updated_count

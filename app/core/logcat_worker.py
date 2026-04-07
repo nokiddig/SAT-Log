@@ -5,6 +5,8 @@ import time
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
+from PyQt6.QtCore import QThread
+
 from app.core.adb_client import AdbError, build_adb_command, fetch_pid_package_map
 from app.core.logcat_parser import LogcatParser
 from app.models.log_entry import LogEntry
@@ -15,6 +17,7 @@ class LogcatWorker(QObject):
     status_changed = pyqtSignal(str)
     error = pyqtSignal(str)
     finished = pyqtSignal()
+    pid_map_updated = pyqtSignal(dict)
 
     BATCH_SIZE = 150
     FLUSH_INTERVAL_SECONDS = 0.15
@@ -28,6 +31,8 @@ class LogcatWorker(QObject):
         self._process: subprocess.Popen[str] | None = None
         self._parser = LogcatParser()
         self._pid_package_map: dict[str, str] = {}
+        self._pid_thread: QThread | None = None
+        self._pid_worker: PIDRefreshWorker | None = None
 
     @pyqtSlot()
     def run(self) -> None:
@@ -35,10 +40,8 @@ class LogcatWorker(QObject):
         self._stop_requested = False
         buffered_entries: list[LogEntry] = []
         last_flush = time.monotonic()
-        last_pid_refresh = 0.0
 
         try:
-            self._refresh_pid_package_map()
             command = build_adb_command(["logcat", "-v", "threadtime", "*:V"], self._device_serial)
             self.status_changed.emit(f"Dang doc logcat tu thiet bi {self._device_serial} ...")
             self._process = subprocess.Popen(
@@ -55,11 +58,9 @@ class LogcatWorker(QObject):
             if self._process.stdout is None:
                 raise AdbError("Khong the mo stdout cua tien trinh adb logcat.")
 
-            while self._running:
-                if time.monotonic() - last_pid_refresh >= self.PID_REFRESH_SECONDS:
-                    self._refresh_pid_package_map(silent=True)
-                    last_pid_refresh = time.monotonic()
+            self._start_pid_refresher()
 
+            while self._running:
                 line = self._process.stdout.readline()
                 if not line:
                     if self._process.poll() is not None:
@@ -90,8 +91,33 @@ class LogcatWorker(QObject):
             self.error.emit(f"Loi khong mong doi khi doc logcat: {exc}")
         finally:
             self._terminate_process()
+            self._stop_pid_refresher()
             self._running = False
             self.finished.emit()
+
+    def _start_pid_refresher(self) -> None:
+        self._pid_thread = QThread(self)
+        self._pid_worker = PIDRefreshWorker(self._device_serial, self.PID_REFRESH_SECONDS)
+        self._pid_worker.moveToThread(self._pid_thread)
+        self._pid_thread.started.connect(self._pid_worker.run)
+        self._pid_worker.pid_map_updated.connect(self._update_pid_map)
+        self._pid_worker.error.connect(self.error.emit)
+        self._pid_worker.finished.connect(self._pid_thread.quit)
+        self._pid_worker.finished.connect(self._pid_worker.deleteLater)
+        self._pid_thread.finished.connect(self._pid_thread.deleteLater)
+        self._pid_thread.start()
+
+    def _stop_pid_refresher(self) -> None:
+        if self._pid_worker:
+            self._pid_worker.stop()
+        if self._pid_thread:
+            self._pid_thread.wait(2000)
+            self._pid_thread = None
+            self._pid_worker = None
+
+    def _update_pid_map(self, pid_map: dict[str, str]) -> None:
+        self._pid_package_map = pid_map
+        self.pid_map_updated.emit(pid_map)
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -128,3 +154,35 @@ class LogcatWorker(QObject):
                 self._process.kill()
                 self._process.wait(timeout=1.0)
         self._process = None
+
+
+class PIDRefreshWorker(QObject):
+    pid_map_updated = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, device_serial: str, interval_seconds: float) -> None:
+        super().__init__()
+        self._device_serial = device_serial
+        self._interval_seconds = interval_seconds
+        self._running = False
+        self._stop_requested = False
+
+    @pyqtSlot()
+    def run(self) -> None:
+        self._running = True
+        self._stop_requested = False
+
+        while self._running and not self._stop_requested:
+            try:
+                pid_map = fetch_pid_package_map(self._device_serial)
+                self.pid_map_updated.emit(pid_map)
+            except AdbError as exc:
+                self.error.emit(str(exc))
+            time.sleep(self._interval_seconds)
+
+        self.finished.emit()
+
+    def stop(self) -> None:
+        self._stop_requested = True
+        self._running = False
